@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -22,6 +23,7 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = "gemini-3.5-flash"
 FALLBACK_MODEL = "gemini-2.5-flash"  # used automatically if the default is unavailable
+RETRY_DELAYS = (2, 5)  # seconds to wait before retrying when Gemini is busy (503)
 MAX_FILE_MB = 10
 MAX_SOURCE_CHARS = 60_000
 MIN_SOURCE_CHARS = 300  # below this we assume a scanned / image-only PDF
@@ -167,16 +169,41 @@ def _call_model(api_key: str, model: str, prompt: str) -> str:
     return text
 
 
+def _is_temporary(exc: Exception) -> bool:
+    """True for 'server busy' type errors that usually go away if we wait a little."""
+    low = str(exc).lower()
+    return any(k in low for k in ("503", "unavailable", "high demand", "overloaded", "504", "deadline_exceeded"))
+
+
+def _is_missing_model(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "404" in low or "not_found" in low or "not found" in low
+
+
 def call_gemini(api_key: str, model: str, prompt: str) -> str:
-    """Call Gemini; if the chosen model does not exist for this key, retry with the fallback."""
-    try:
-        return _call_model(api_key, model, prompt)
-    except Exception as exc:
-        msg = str(exc).lower()
-        model_missing = "404" in msg or "not_found" in msg or "not found" in msg
-        if model_missing and model != FALLBACK_MODEL:
-            return _call_model(api_key, FALLBACK_MODEL, prompt)
-        raise
+    """Call Gemini with retries.
+
+    * Busy server (503): wait and retry, then switch to the fallback model.
+    * Model not found (404): switch to the fallback model.
+    * Anything else (bad key, quota...): raise immediately.
+    """
+    models = [model] if model == FALLBACK_MODEL else [model, FALLBACK_MODEL]
+    last_exc = None
+    for current in models:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return _call_model(api_key, current, prompt)
+            except Exception as exc:
+                last_exc = exc
+                if _is_missing_model(exc):
+                    break  # go to the next model
+                if not _is_temporary(exc):
+                    raise
+                if attempt < len(RETRY_DELAYS):
+                    time.sleep(RETRY_DELAYS[attempt])
+                else:
+                    break  # retries used up, go to the next model
+    raise last_exc
 
 
 def parse_json(raw: str) -> dict:
@@ -277,6 +304,11 @@ def generate_quiz(material: str, n: int, difficulty: str, qtype: str, api_key: s
 def friendly_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
+    if _is_temporary(exc):
+        return (
+            "Gemini is very busy right now (high demand). The app already retried and tried a backup model. "
+            "Please wait a minute and click Generate quiz again."
+        )
     if "api key" in low or "api_key" in low or "permission_denied" in low or "401" in low or "403" in low:
         return f"The Gemini API key was rejected. Check that it is correct and enabled. Details: {msg[:300]}"
     if "429" in low or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
